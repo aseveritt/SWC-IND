@@ -1,0 +1,339 @@
+---
+title: "CUL3 KD - Nia Teerikorpi NPC.RM"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+__Author:__ Amanda Everitt  
+__Began:__ 02/28/2019  
+__Finished:__ 03/01/2019  
+
+#[Experimental Design]
+- Nia has a WTC11_dCas9 cell line with a CUL3 KD using NPC.RM differentiation with multiple different guides for each. 
+- All passage 9 
+
+#[Questions]
+- What is the efficiency of the KD? Does it match predicted by qPCR?
+- Which guide is most efficient?
+- Is there non-specific KD?
+- Does our data corroborate findings in Xenopus? Other ASD studies?
+
+#[Pre-processing]
+- Experiment performed by Nia
+- Reads aligned to AmpliSeq.hg19 transcriptome using default IonTorrent Software (TMAP)
+
+#[Results at a Glance]
+- tbd
+
+
+```{r, include=FALSE}
+knitr::opts_knit$set(root.dir = "/Users/AEveritt/projects/AmpliSeq_Analysis/SWC/", cache=TRUE, autodep=TRUE)
+out_dir = "/Users/AEveritt/projects/AmpliSeq_Analysis/SWC/output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+library(ggplot2)
+```
+
+```{r, include=F}
+#FUNCTIONS
+amanda.plot.density <- function(df, title, my.ylim, my.xlim){
+  require(RColorBrewer)
+  colramp=colorRampPalette(brewer.pal(4, "BuPu"))(ncol(df))
+  plot(density(df[,1]),col="white",lwd=3,ylim=my.ylim, xlim=my.xlim, main=title)
+  for(i in 1:ncol(df)){lines(density(df[,i]),lwd=1,col=colramp[i])}
+}
+
+amanda.output.dex <- function(df, name, annotation){
+  cat(paste(nrow(df), "total\n"))
+  df$Description <- annotation[rownames(annotation) %in% rownames(df), c("MIM_MORBID_DESCRIPTION")]
+  df$NCBI_name <- annotation[rownames(annotation) %in% rownames(df), c("NCBI_NAME")]
+  df$Entrez_ID <- annotation[rownames(annotation) %in% rownames(df), c("ENTREZ_GENE_ID")]
+  write.table(df, paste0(out_dir, "/res/", name, ".csv"), sep=",", col.names = NA)
+  
+  #Grab anything significant
+  df_sig <- subset(df, (!is.na(df$padj)) & (df$padj < 0.05))
+  cat(paste(nrow(df_sig), "have adj pval < 0.05\n"))
+  df_sig <- df_sig[order(df_sig$padj),]
+  write.table(df_sig, paste0(out_dir, "/DEX/", name, ".csv"), sep=",", col.names = NA)
+
+  #Grab higher confidence genes based on LogFC
+  df_sigHC <- df_sig[abs(df_sig$log2FoldChange) > 1,]
+  cat(paste(nrow(df_sigHC), "have abs(logFC) > 1\n\n\n"))
+  df_sigHC <- df_sigHC[order(df_sigHC$log2FoldChange),]
+  write.table(df_sigHC, paste0(out_dir, "/hcDEX/", name, ".csv"), sep=",", col.names = NA)
+  return(list("HC"=df_sigHC, "DEX"= df_sig))
+}
+
+amanda.output.go <-function(name, DEgenes, backgroundGenes, genome, ID){ # GO pathway over-representation analysis
+  suppressPackageStartupMessages(library(goseq)) #load here because collides with dplyr
+  suppressPackageStartupMessages(library(GO.db))
+  genes <- as.integer(backgroundGenes %in% DEgenes) # make vector for analysis that contains all genes (1 for DEX, 0 for not)
+  names(genes) <- (backgroundGenes)
+  
+  pwf=nullp(genes,genome, ID) #obtain a weighting for each gene, depending on its length
+  GO.wall=goseq(pwf,genome, ID)
+  enriched.GO <- GO.wall[p.adjust(GO.wall$over_represented_pvalue, method="BH") < 0.05, ] #apply FDR correction
+  if (nrow(enriched.GO) > 0){write.csv(enriched.GO, paste0(out_dir, "/GO/", name, ".csv"),row.names = FALSE)}
+  return(enriched.GO)
+}
+```
+
+### Step 1: Load counts and metadata
+```{r, include=F}
+suppressPackageStartupMessages(library(stringr))
+
+cts <- read.delim("raw_data/absolute_counts_Chip16.txt", sep = "\t")
+```
+
+- Check that file imported properly 
+```{r, eval=F}
+dim(cts)
+cts[1:5,1:5]
+colnames(cts)
+```
+
+- Load metadata
+```{r}
+metadata <- read.delim("raw_data/Chip16_metadata.csv", sep = ",")
+```
+
+```{r, eval=F}
+dim(metadata)
+head(metadata)
+colnames(metadata)
+```
+
+- Perform a bit of QC on files -- are there any sample names that occur in metadata file and not the counts file?
+```{r}
+check1 <- setdiff(as.vector(metadata$IonCode), colnames(cts))
+#Returns of vector if vectors are not the same
+if (length(check1) != 0){
+  cat(paste("**WARNING:", as.vector(check1),"not found in metadata sheet**\n"))
+  metadata <- metadata[!metadata$IonCode %in% check1,]
+  cat("Samples have been removed from metadata sheet. Please check if these were H20 samples or a possible error.\n")
+}
+```
+
+```{r}
+#Change head of cts
+suppressPackageStartupMessages(library(data.table))
+setnames(cts, old = as.vector(metadata$IonCode), new=as.vector(metadata$FullID))
+#Lets use the full, unique IDs rather than the IonCodes since they're not informative
+
+colnames(cts)
+```
+
+
+### Step 2: Explore Raw Data/Normalize
+```{r, echo=F}
+#Plot distribution of Raw counts
+dim(cts)
+
+dont_include <- c("Gene","Target","COSMIC_CGC_FLAG","NCBI_NAME","HGNC_SYMBOL_ACC","MIM_MORBID_DESCRIPTION","ENTREZ_GENE_ID","U133PLUS2_PSID")
+cts_log2 <- log2((cts[, !colnames(cts) %in% dont_include]) +1)
+#create log2 for plotting purposes
+
+amanda.plot.density(cts_log2, title=paste0("Raw counts (n=",dim(cts)[1],")"), my.ylim = c(0,0.35), my.xlim = c(-1,15))
+```
+
+- Remove genes with no counts
+```{r}
+cts <- cts[rowSums(cts[, !colnames(cts) %in% dont_include]) > 0, ]
+dim(cts)
+
+cts_log2 <- log2((cts[, !colnames(cts) %in% dont_include]) +1)
+amanda.plot.density(cts_log2, title=paste0("Zero-removed counts (n=",dim(cts)[1],")"), my.ylim = c(0,0.35), my.xlim = c(-1,15))
+```
+
+- Remove low expressing genes
+```{r}
+cts <- cts[rowSums(cts[, !colnames(cts) %in% dont_include] > 10) >= 3,] #filer counts that have don't have at least 5 counts in 3 samples 
+
+cts_log2 <- log2((cts[, !colnames(cts) %in% dont_include]) +1)
+amanda.plot.density(cts_log2, title=paste0("low-expressing removed counts (n=",dim(cts)[1],")"), my.ylim = c(0,0.35), my.xlim = c(-1,15))
+```
+
+- Reformat the data for ease
+```{r}
+#Reformat the data
+dim(cts[duplicated(cts$Gene), ]) #5 non-unique genes
+rownames(cts) = make.names(cts$Gene, unique=TRUE)
+rownames(metadata) = make.names(metadata$FullID)
+original_cts <- cts
+cts <- cts[, !colnames(cts) %in% dont_include]
+```
+
+- Library size normalization
+```{r}
+#Library Size normalization
+cpm <- apply(cts,2, function(x) (x/sum(x))*1000000)
+log.cpm <- log2(cpm + 1)
+```
+
+```{r}
+#Quantile Normalization
+suppressPackageStartupMessages(library(preprocessCore))
+norm_counts <- normalize.quantiles(as.matrix(cpm), copy = TRUE)
+colnames(norm_counts) <- colnames(cpm)
+rownames(norm_counts) <- rownames(cpm)
+log.norm_counts <- log2(norm_counts + 1)
+```
+
+```{r}
+#Plot new distributions
+amanda.plot.density(log.cpm, title="Library Size Normalized counts", my.ylim = c(0,0.25), my.xlim = c(-1,15))
+amanda.plot.density(log.norm_counts, title="Quantile Normalized counts", my.ylim = c(0,0.25), my.xlim = c(-1,15))
+```
+
+- Explore what data looks like with PCAs
+```{r}
+pca <- prcomp(t(log.norm_counts), center = T)
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+d <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2])
+e <- merge(d, metadata, by="row.names")
+e$LibPrep <- as.factor(e$LibPrep)
+
+ggplot(data = e, 
+       aes_string(x = "PC1", y = "PC2", color = "ValidGene", shape="LibPrep")) + 
+  geom_point(size = 3) + coord_fixed() + 
+  xlab(paste0("PC1: ", round(percentVar[1] * 100), "% variance")) + 
+  ylab(paste0("PC2: ", round(percentVar[2] * 100), "% variance")) +
+  ggtitle("PCA -- doesn't seem to be any batch issues")
+```
+
+- Is the separation because of the different guides?
+```{r}
+ggplot(data = e, 
+       aes_string(x = "PC1", y = "PC2", color = "ValidGene", shape="Guide")) + 
+  geom_point(size = 3) + coord_fixed() + 
+  xlab(paste0("PC1: ", round(percentVar[1] * 100), "% variance")) + 
+  ylab(paste0("PC2: ", round(percentVar[2] * 100), "% variance")) +
+  ggtitle("PCA-- NRXN1 guides seem to be causing most variation")
+```
+
+
+- First, lets quickly check if it looks like the KD was successful
+```{r, echo=F, fig.width=10, fig.height=10}
+#HEATMAP
+suppressPackageStartupMessages(library(heatmap3))
+genes.interested.in.plotting <- grep("^CUL|NRXN", rownames(norm_counts), value = TRUE)
+tmp<- as.data.frame(norm_counts[rownames(norm_counts) 
+                              %in% genes.interested.in.plotting, ])
+tmp <- setnames(tmp, old=as.vector(metadata$FullID), new=as.vector(metadata$ShortID))
+heatmap3(tmp, scale= "row",cexCol = 1, main = "KD Genes", margins = c(15, 2))
+```
+
+- You'll notice NRXN1 doesnt come up on this list. It was actually removed for low expression in these cells. For the purpose of the demo we will only go forward with the CUL3 DEX. 
+```{r, echo=F}
+#ROUGH ESTIMATE OF KD
+d<-merge(metadata[,c("ValidGene"), drop=F], melt(norm_counts["CUL3",]), by="row.names")
+ggplot(d, aes(x=ValidGene, y=value)) + 
+    geom_point(size=3) + labs(title="CUL3 KD", x="Treatment",y="Log2 norm counts") + 
+    theme(axis.text.x=element_text(angle=90, hjust=1), legend.position="none") + 
+    NULL
+```
+
+- save normalized counts for any other follow up analyses (coexpression for example) to output file
+```{r}
+write.csv(as.data.frame(norm_counts), file=paste0(out_dir, "/00_norm_counts.csv"))
+```
+
+
+
+### Step 4: Differential Gene Expression and GO analysis
+- Collapsing both Scrambles into one control group
+- For the purpose of the demo we are going to ignore the different guides here, but if you want to practice later this could be a good exercise. 
+
+- DESeq2 takes in the raw counts (not normalized because DESeq2's model internally corrects for library size, so transformed or normalized values such as counts scaled by library size should not be used as input.)
+- https://www.bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+```{r}
+#First, lets remove the NRXN1 samples
+cts <- cts[, !colnames(cts) %in% grep("NRXN1", colnames(cts), value = T)]
+metadata <- metadata[!rownames(metadata) %in% grep("NRXN1", rownames(metadata), value = T), ]
+```
+
+```{r}
+#Lets create a column thats just the grouping we exactly want so we can visualize this
+metadata$Condition <- metadata$ValidGene #Create a duplicate column
+metadata$Condition <- as.character(metadata$Condition)
+metadata[metadata$ValidGene %in% c("Scramble1872", "Scramble1873"), ]$Condition <- "Control"
+metadata[,c("Condition","ValidGene")]
+
+#Set what the reference level is -- tell the computer which is your control group
+metadata$Condition <- as.factor(metadata$Condition)
+metadata$Condition <- relevel(metadata$Condition, ref = "Control")
+```
+
+```{r}
+suppressPackageStartupMessages(library(DESeq2))
+
+#What design should we use? 
+#Linear models and generalized linear models incorporate a model matrix which is one of the terms for DESeq
+
+model.matrix(~ Condition, metadata)
+dds <- DESeqDataSetFromMatrix(countData = cts, colData = metadata, design= ~Condition) #create object for DESeq
+dds <- DESeq(dds) #run deseq2 model
+dds
+resultsNames(dds)
+```
+
+- Visualize the dispersion estimates (plots the per-gene dispersion estimates together with the fitted mean-dispersion relationship)
+```{r}
+plotDispEsts(dds)
+```
+
+```{r}
+#Generate results tables which extracts a results table with log2 fold changes, p values and adjusted p values
+res <- results(dds, name="Condition_CUL3_vs_Control") 
+#This is the standard call, but you can pass it different model types. The one below is what I typically use
+
+
+res_lfcShrink <- lfcShrink(dds, coef="Condition_CUL3_vs_Control", type="apeglm")
+#This model is one I particularly like using because it incorporates a logFC shrinkage meaning that genes with low counts logFC not have inflated fold changes
+
+#Now we can compare the two if you want
+summary(res)
+summary(res_lfcShrink)
+#Significance thresholds will be the same because apeglm only changes the fold changes
+```
+
+- We can visualize this as well 
+```{r}
+plotMA(res, ylim=c(-2,2), main="MA plot-- standard model")
+plotMA(res_lfcShrink, ylim=c(-2,2), main = "MA plot -- logFC shrinkage")
+```
+
+- Order by adjusted pvalue
+```{r}
+resOrdered <- res_lfcShrink[order(res_lfcShrink$padj),]
+```
+
+
+- How many adjusted p-values were less than 0.05?
+```{r}
+sum(res$padj < 0.05, na.rm=TRUE)
+resSig <- subset(resOrdered, padj < 0.05)
+```
+
+- Output your complete dataframe as well as only the significantly DE genes
+```{r}
+write.csv(as.data.frame(resOrdered), file=paste0(out_dir, "01_CUL3_results.csv"))
+write.csv(as.data.frame(resSig), file=paste0(out_dir, "02_CUL3_results_DEX.csv"))
+```
+
+
+### Step 5: Lets look at the results! 
+
+- First, lets create a heatmap of only the DEX genes
+```{r, fig.height=10, fig.width=10}
+data.to.plot <- data.frame(norm_counts[rownames(norm_counts) %in% rownames(resSig),
+                            colnames(norm_counts) %in% rownames(metadata)])
+#Lets give better names to the columns so they're not so long
+setnames(data.to.plot, old = as.vector(metadata$FullID), new=as.vector(metadata$ShortID))
+
+heatmap3(data.to.plot, labRow = "", main = "CUL3 DEX Genes", margins = c(12,3))
+```
+
+
+#More to come [ after lunch when I finish this :) ]
